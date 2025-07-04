@@ -1,4 +1,4 @@
-package rpc;
+package com.rpc.api;
 
 /**
  * 定义通用的序列化器接口。

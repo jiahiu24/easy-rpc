@@ -1,4 +1,4 @@
-package rpc;
+package com.rpc.api;
 
 /**
  * RPC 服务器端拦截器接口。

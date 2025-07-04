@@ -1,4 +1,4 @@
-package rpc;
+package com.rpc.api;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;

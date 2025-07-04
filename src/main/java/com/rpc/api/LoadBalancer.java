@@ -1,4 +1,4 @@
-package rpc;
+package com.rpc.api;
 
 import java.util.List;
 

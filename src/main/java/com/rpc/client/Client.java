@@ -1,9 +1,6 @@
-package client;
+package com.rpc.client;
 
-import rpc.RpcClient;
-import service.Calculator;
-
-import java.lang.reflect.InvocationTargetException;
+import com.rpc.server.Calculator;
 
 public class Client {
     public static void main(String[] args) throws Exception { // 更改方法签名，以抛出异常

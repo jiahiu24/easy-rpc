@@ -1,4 +1,4 @@
-package service;
+package com.rpc.server;
 
 public class CalculatorImpl implements Calculator {
     @Override

@@ -1,13 +1,11 @@
-package rpc;
+package com.rpc.client;
 
+import com.rpc.api.*;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.serialization.ClassResolvers;
-import io.netty.handler.codec.serialization.ObjectDecoder;
-import io.netty.handler.codec.serialization.ObjectEncoder;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
@@ -23,15 +21,14 @@ import java.util.List;
 import java.util.Map; // 导入 Map
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.ServiceLoader;
-/**
- * RpcClient类，现在使用Netty进行网络通信和ZooKeeper进行服务发现。
- * 改进了连接复用和请求ID匹配。
- */
+// 导入 Guava Retrying 相关的类
+import com.github.rholder.retry.*; // 导入所有 Retrying 相关的类
+import com.google.common.base.Predicates; // 用于定义重试条件
+
 public class RpcClient {
     private String zkAddress;
     private ZooKeeper zk;
@@ -47,6 +44,18 @@ public class RpcClient {
     private final RpcClientHandler rpcClientHandler; // 单例Handler，处理所有Channel的响应
     private Serializer serializer;
     private LoadBalancer loadBalancer;
+    //新增：重试服务的白名单/黑名单或其他策略配置
+    //这里简单地用一个Set来表示哪些接口需要重试
+    private final ConcurrentHashMap<String, Retryer<RpcResponse>> retryerMap = new ConcurrentHashMap<>();
+    private final List<String> retryableServices = new CopyOnWriteArrayList<>(); // 可以配置哪些服务需要重试
+    private final long RETRY_INTERVAL_MS = 100; // 重试间隔
+    private final int MAX_RETRY_ATTEMPTS = 3;   // 最大重试次数
+
+    // 新增：熔断器相关配置和存储
+    private final ConcurrentHashMap<String, CircuitBreaker> circuitBreakerMap = new ConcurrentHashMap<>();
+    private final int FAILURE_THRESHOLD = 5;      // 连续失败次数达到这个值，熔断器打开
+    private final long OPEN_TIMEOUT_MS = 5000;    // 熔断器打开后持续的时间（冷却时间）
+    private final int HALF_OPEN_TEST_ATTEMPTS = 1; // 半开状态下允许尝试的成功请求次数
 
     public RpcClient(String zkAddress) {
         this.zkAddress = zkAddress;
@@ -55,6 +64,16 @@ public class RpcClient {
         loadLoadBalancer();
         initNettyClient();
         this.rpcClientHandler = new RpcClientHandler(pendingRpcFutures);
+
+        // 初始化重试策略
+        // 添加需要重试的服务接口名
+        retryableServices.add("com.rpc.server.Calculator");
+
+        // 这里以 Calculator 为例，您可以根据实际需求动态创建
+        circuitBreakerMap.put("com.rpc.server.Calculator", new DefaultCircuitBreaker(
+                "com.rpc.server.Calculator", FAILURE_THRESHOLD, OPEN_TIMEOUT_MS, HALF_OPEN_TEST_ATTEMPTS));
+
+        System.out.println("RpcClient initialized.");
     }
 
     private void loadLoadBalancer() {
@@ -96,99 +115,176 @@ public class RpcClient {
                 new InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-                        if (serviceAddresses.isEmpty()) {
-                            throw new RuntimeException("No service provider available for " + interfaceClass.getName() + ". Please check if service is running and registered.");
-                        }
-                        // 使用随机负载均衡
-                        String chosenAddress = loadBalancer.select(serviceAddresses); // 修改这里
-                        if (chosenAddress == null) {
-                            throw new RuntimeException("LoadBalancer failed to select a service address.");
-                        }
-                        String[] addressParts = chosenAddress.split(":");
-                        String host = addressParts[0];
-                        int port = Integer.parseInt(addressParts[1]);
+                        final String serviceInterfaceName = interfaceClass.getName();
 
-                        // 尝试从缓存获取或建立Channel
-                        Channel channel = cachedChannels.computeIfAbsent(chosenAddress, k -> {
-                            try {
-                                System.out.println("Establishing new channel to " + chosenAddress);
-                                Bootstrap bootstrap = new Bootstrap();
-                                bootstrap.group(workerGroup)
-                                        .channel(NioSocketChannel.class)
-                                        .option(ChannelOption.TCP_NODELAY, true)
-                                        .handler(new ChannelInitializer<SocketChannel>() {
-                                            @Override
-                                            protected void initChannel(SocketChannel ch) throws Exception {
-                                                ch.pipeline()
-                                                        .addLast(new RpcEncoder(RpcRequest.class, serializer)) // 使用加载的序列化器
-                                                        .addLast(new RpcDecoder(RpcResponse.class, serializer)) // 使用加载的序列化器
-                                                        .addLast(rpcClientHandler);
-                                            }
-                                        });
-                                ChannelFuture connectFuture = bootstrap.connect(host, port).sync();
-                                Channel newChannel = connectFuture.channel();
-                                // 监听Channel关闭事件，从缓存中移除
-                                newChannel.closeFuture().addListener((ChannelFutureListener) f -> {
-                                    System.out.println("Channel to " + k + " closed, removing from cache.");
-                                    cachedChannels.remove(k);
-                                });
-                                return newChannel;
-                            } catch (Exception e) {
-                                System.err.println("Failed to establish channel to " + chosenAddress + ": " + e.getMessage());
-                                throw new RuntimeException("Failed to connect to RPC server", e);
-                            }
-                        });
+                        // 获取或创建对应服务的熔断器
+                        CircuitBreaker circuitBreaker = circuitBreakerMap.computeIfAbsent(serviceInterfaceName, k ->
+                                new DefaultCircuitBreaker(k, FAILURE_THRESHOLD, OPEN_TIMEOUT_MS, HALF_OPEN_TEST_ATTEMPTS));
 
-                        // 确保Channel是活跃的
-                        if (!channel.isActive()) {
-                            // 如果Channel不活跃，从缓存中移除并重新尝试建立
-                            System.err.println("Cached channel to " + chosenAddress + " is not active. Re-establishing connection.");
-                            cachedChannels.remove(chosenAddress); // 移除不活跃的通道
-                            // 递归调用或者抛出异常让上层处理重试
-                            // 注意：在生产环境中，这里可能需要更健壮的重试策略和熔断机制
-                            return invoke(proxy, method, args); // 简单的重试机制
+                        // ==== 熔断器前置检查 ====
+                        if (!circuitBreaker.allowRequest()) {
+                            // 熔断器处于 OPEN 状态，或半开状态下不被允许通过
+                            System.out.println("Circuit Breaker [" + serviceInterfaceName + "] is " + circuitBreaker.getState() + ". Request blocked.");
+                            throw new CircuitBreakerOpenException("Circuit Breaker for " + serviceInterfaceName + " is OPEN.");
                         }
 
-                        // 构建RPC请求
-                        String requestId = java.util.UUID.randomUUID().toString();
-                        RpcRequest request = new RpcRequest(
-                                requestId,
-                                interfaceClass.getName(),
-                                method.getName(),
-                                method.getParameterTypes(),
-                                args
-                        );
-
-                        // 为本次请求创建RpcFuture，并放入map中
-                        RpcFuture rpcFuture = new RpcFuture();
-                        pendingRpcFutures.put(requestId, rpcFuture);
-
-                        System.out.println("Sending request (ID: " + request.getRequestId() + ") to " + chosenAddress + ": " + request);
+                        RpcResponse response = null;
+                        Throwable rpcCallException = null; // 用于捕获 performRpcCall 抛出的异常
 
                         try {
-                            // 使用已连接的channel发送请求
-                            channel.writeAndFlush(request).sync(); // 异步发送，然后同步等待写入完成
-                            System.out.println("Request sent. Waiting for response for ID: " + requestId);
-
-                            // 等待结果，设置超时
-                            RpcResponse response = rpcFuture.get(5, TimeUnit.SECONDS); // 阻塞等待响应
-                            // 收到结果后移除，避免内存泄漏
-                            pendingRpcFutures.remove(requestId);
-
-                            if (response.isSuccess()) {
-                                return response.getResult();
+                            // 决定是否使用重试
+                            if (retryableServices.contains(serviceInterfaceName)) {
+                                Retryer<RpcResponse> retryer = retryerMap.computeIfAbsent(serviceInterfaceName, k ->
+                                        RetryerBuilder.<RpcResponse>newBuilder()
+                                                .retryIfExceptionOfType(RuntimeException.class)
+                                                .retryIfResult(Predicates.isNull())
+                                                .withWaitStrategy(WaitStrategies.fixedWait(RETRY_INTERVAL_MS, TimeUnit.MILLISECONDS))
+                                                .withStopStrategy(StopStrategies.stopAfterAttempt(MAX_RETRY_ATTEMPTS))
+                                                .build());
+                                try {
+                                    response = retryer.call(() -> {
+                                        try {
+                                            return performRpcCall(serviceInterfaceName, method, args);
+                                        } catch (Throwable e) {
+                                            throw new RuntimeException(e);
+                                        }
+                                    });
+                                } catch (RetryException e) {
+                                    // 所有重试都失败了
+                                    System.err.println("RPC call (service: " + serviceInterfaceName + ", method: " + method.getName() + ") failed after multiple retries: " + e.getMessage());
+                                    // 检查最终的失败原因，如果是InvocationTargetException，取出原始异常
+                                    rpcCallException = e.getLastFailedAttempt().getExceptionCause(); // <-- 修正这里的 'has'
+                                }
                             } else {
-                                // 远程调用发生异常，包装为InvocationTargetException
-                                throw new InvocationTargetException(response.getException());
+                                // 对于不需要重试的服务，直接进行调用
+                                response = performRpcCall(serviceInterfaceName, method, args);
                             }
-                        } catch (Exception e) {
-                            System.err.println("RPC call (ID: " + requestId + ") failed: " + e.getMessage());
-                            e.printStackTrace();
-                            pendingRpcFutures.remove(requestId); // 失败也移除
-                            throw new RuntimeException("RPC call failed: " + e.getMessage(), e);
+
+                            // 如果 response 为 null 且 rpcCallException 也为 null，说明有些未处理的异常
+                            if (response == null && rpcCallException == null) {
+                                rpcCallException = new RuntimeException("Unknown RPC call failure for " + serviceInterfaceName + "." + method.getName());
+                            }
+
+                            if (rpcCallException == null) { // RPC 调用成功
+                                circuitBreaker.recordSuccess();
+                                // 如果返回了 RpcResponse 但其 internal success 标志为 false，也视为失败
+                                if (!response.isSuccess()) {
+                                    circuitBreaker.recordFailure();
+                                    throw new InvocationTargetException(response.getException());
+                                }
+                                return response.getResult(); // 返回实际的结果
+                            } else { // RPC 调用失败 ( سواء是重试后仍失败，还是直接调用失败 )
+                                circuitBreaker.recordFailure();
+                                throw rpcCallException; // 抛出原始异常
+                            }
+
+                        } catch (Throwable e) {
+                            // 捕获所有从 performRpcCall 或重试器中抛出的异常
+                            // 如果是 CircuitBreakerOpenException，就不再记录失败
+                            if (!(e instanceof CircuitBreakerOpenException)) {
+                                circuitBreaker.recordFailure(); // 记录失败，如果熔断器未打开
+                            }
+                            throw e; // 重新抛出给客户端
                         }
                     }
                 });
+    }
+
+    /**
+     * 执行实际的 RPC 调用逻辑，提取出来以便重试器调用。
+     * @param serviceInterfaceName 接口名称
+     * @param method 调用的方法
+     * @param args 方法参数
+     * @return RpcResponse
+     * @throws Throwable 如果 RPC 调用失败或远程方法抛出异常
+     */
+    private RpcResponse performRpcCall(String serviceInterfaceName, Method method, Object[] args) throws Throwable {
+        if (serviceAddresses.isEmpty()) {
+            throw new RuntimeException("No service provider available for " + serviceInterfaceName + ". Please check if service is running and registered.");
+        }
+
+        // 使用负载均衡器选择一个可用的服务地址
+        String chosenAddress = loadBalancer.select(serviceAddresses);
+        if (chosenAddress == null) {
+            throw new RuntimeException("LoadBalancer failed to select a service address.");
+        }
+
+        String[] addressParts = chosenAddress.split(":");
+        String host = addressParts[0];
+        int port = Integer.parseInt(addressParts[1]);
+        // 尝试从缓存获取或建立Channel
+        Channel channel = cachedChannels.computeIfAbsent(chosenAddress, k -> {
+            try {
+                System.out.println("Establishing new channel to " + chosenAddress);
+                Bootstrap bootstrap = new Bootstrap();
+                bootstrap.group(workerGroup)
+                        .channel(NioSocketChannel.class)
+                        .option(ChannelOption.TCP_NODELAY, true)
+                        .handler(new ChannelInitializer<SocketChannel>() {
+                            @Override
+                            protected void initChannel(SocketChannel ch) throws Exception {
+                                ch.pipeline()
+                                        .addLast(new RpcEncoder(RpcRequest.class, serializer))
+                                        .addLast(new RpcDecoder(RpcResponse.class, serializer))
+                                        .addLast(rpcClientHandler);
+                            }
+                        });
+                ChannelFuture connectFuture = bootstrap.connect(host, port).sync();
+                Channel newChannel = connectFuture.channel();
+                newChannel.closeFuture().addListener((ChannelFutureListener) f -> {
+                    System.out.println("Channel to " + k + " closed, removing from cache.");
+                    cachedChannels.remove(k);
+                });
+                return newChannel;
+            } catch (Exception e) {
+                System.err.println("Failed to establish channel to " + chosenAddress + ": " + e.getMessage());
+                throw new RuntimeException("Failed to connect to RPC server", e);
+            }
+        });
+
+        // 确保Channel是活跃的
+        if (!channel.isActive()) {
+            System.err.println("Cached channel to " + chosenAddress + " is not active. Re-establishing connection.");
+            cachedChannels.remove(chosenAddress); // 移除不活跃的通道
+            // 如果通道不活跃，直接抛出异常，让重试机制或上层处理
+            throw new RuntimeException("Channel to " + chosenAddress + " is not active.");
+        }
+
+        // 构建RPC请求
+        String requestId = java.util.UUID.randomUUID().toString();
+        RpcRequest request = new RpcRequest(
+                requestId,
+                serviceInterfaceName,
+                method.getName(),
+                method.getParameterTypes(),
+                args
+        );
+
+        // 为本次请求创建RpcFuture，并放入map中
+        RpcFuture rpcFuture = new RpcFuture();
+        pendingRpcFutures.put(requestId, rpcFuture);
+
+        System.out.println("Sending request (ID: " + request.getRequestId() + ") to " + chosenAddress + ": " + request);
+
+        try {
+            channel.writeAndFlush(request).sync();
+            System.out.println("Request sent. Waiting for response for ID: " + requestId);
+
+            RpcResponse response = rpcFuture.get(5, TimeUnit.SECONDS);
+            pendingRpcFutures.remove(requestId); // 收到结果或超时后移除
+
+            if (response.isSuccess()) {
+                return response; // 返回完整的 RpcResponse
+            } else {
+                // 远程调用发生异常，包装为 InvocationTargetException
+                throw new InvocationTargetException(response.getException());
+            }
+        } catch (Exception e) {
+            System.err.println("RPC call (ID: " + requestId + ") failed: " + e.getMessage());
+            e.printStackTrace();
+            pendingRpcFutures.remove(requestId); // 失败也移除
+            throw e; // 重新抛出异常，让重试器捕获
+        }
     }
 
     private void connectZooKeeper() {
@@ -258,7 +354,7 @@ public class RpcClient {
         // 这是一个简化的实现，实际中可能需要维护一个已发现服务接口的列表
         // 然后对每个接口调用 discoverService
         // 例如，如果 Calculator 是唯一一个服务接口：
-        discoverService("service.Calculator");
+        discoverService("com.rpc.server.Calculator");
         // 如果有多个服务，这里需要迭代所有已知的服务接口名称
     }
 

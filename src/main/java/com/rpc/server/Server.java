@@ -1,9 +1,7 @@
-package server;
+package com.rpc.server;
 
-import rpc.RpcServer;
-// import rpc.LoggerInterceptor; // 移除此导入，因为现在是SPI自动加载
-import service.Calculator;
-import service.CalculatorImpl;
+// import com.rpc.api.LoggerInterceptor; // 移除此导入，因为现在是SPI自动加载
+
 
 public class Server {
     public static void main(String[] args) {
