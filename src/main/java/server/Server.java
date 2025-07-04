@@ -1,22 +1,29 @@
 package server;
 
+import rpc.RpcServer;
+// import rpc.LoggerInterceptor; // 移除此导入，因为现在是SPI自动加载
 import service.Calculator;
 import service.CalculatorImpl;
-import rpc.RpcServer;
 
 public class Server {
-    public static void main(String[] args) throws Exception { // 更改方法签名，以抛出异常
-        String zkAddress = "localhost:2080";
+    public static void main(String[] args) {
+        String zkAddress = "127.0.0.1:2080";
+        int rpcPort = 8080;
 
-        Calculator calculator = new CalculatorImpl();
         RpcServer rpcServer = new RpcServer(zkAddress);
-        rpcServer.register(calculator);
+
+        rpcServer.register(new CalculatorImpl());
+
+        // 移除这行，拦截器现在通过 SPI 自动加载
+        // rpcServer.addInterceptor(new LoggerInterceptor());
 
         try {
-            rpcServer.start(8080);
+            rpcServer.start(rpcPort);
+        } catch (Exception e) {
+            System.err.println("RPC Server failed to start: " + e.getMessage());
+            e.printStackTrace();
         } finally {
             rpcServer.closeZooKeeper();
-            System.out.println("Server application shutting down.");
         }
     }
 }

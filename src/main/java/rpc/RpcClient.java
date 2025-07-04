@@ -27,7 +27,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
-
+import java.util.ServiceLoader;
 /**
  * RpcClient类，现在使用Netty进行网络通信和ZooKeeper进行服务发现。
  * 改进了连接复用和请求ID匹配。
@@ -45,13 +45,42 @@ public class RpcClient {
     // 客户端 Channel 缓存，每个服务地址对应一个 Channel
     private ConcurrentHashMap<String, Channel> cachedChannels = new ConcurrentHashMap<>();
     private final RpcClientHandler rpcClientHandler; // 单例Handler，处理所有Channel的响应
+    private Serializer serializer;
+    private LoadBalancer loadBalancer;
 
     public RpcClient(String zkAddress) {
         this.zkAddress = zkAddress;
         connectZooKeeper();
+        loadSerializer(); // 新增：加载序列化器
+        loadLoadBalancer();
         initNettyClient();
-        // RpcClientHandler 需要知道如何处理所有Channel的响应，所以是单例
         this.rpcClientHandler = new RpcClientHandler(pendingRpcFutures);
+    }
+
+    private void loadLoadBalancer() {
+        ServiceLoader<LoadBalancer> loader = ServiceLoader.load(LoadBalancer.class);
+        for (LoadBalancer lb : loader) {
+            this.loadBalancer = lb;
+            System.out.println("[SPI] Loaded LoadBalancer: " + lb.getClass().getSimpleName());
+            break; // 只加载一个
+        }
+        if (this.loadBalancer == null) {
+            // 如果没有找到，可以使用默认的随机负载均衡
+            this.loadBalancer = new RandomLoadBalancer();
+            System.out.println("[SPI] No LoadBalancer implementation found via SPI, using default RandomLoadBalancer.");
+        }
+    }
+
+    private void loadSerializer() {
+        ServiceLoader<Serializer> loader = ServiceLoader.load(Serializer.class);
+        for (Serializer s : loader) {
+            this.serializer = s;
+            System.out.println("[SPI] Loaded Serializer: " + s.getClass().getSimpleName());
+            break; // 只加载一个
+        }
+        if (this.serializer == null) {
+            throw new RuntimeException("No Serializer implementation found via SPI!");
+        }
     }
 
     private void initNettyClient() {
@@ -70,9 +99,11 @@ public class RpcClient {
                         if (serviceAddresses.isEmpty()) {
                             throw new RuntimeException("No service provider available for " + interfaceClass.getName() + ". Please check if service is running and registered.");
                         }
-
-                        // 简单的负载均衡：随机选择一个可用的服务地址
-                        String chosenAddress = serviceAddresses.get(ThreadLocalRandom.current().nextInt(serviceAddresses.size()));
+                        // 使用随机负载均衡
+                        String chosenAddress = loadBalancer.select(serviceAddresses); // 修改这里
+                        if (chosenAddress == null) {
+                            throw new RuntimeException("LoadBalancer failed to select a service address.");
+                        }
                         String[] addressParts = chosenAddress.split(":");
                         String host = addressParts[0];
                         int port = Integer.parseInt(addressParts[1]);
@@ -89,9 +120,9 @@ public class RpcClient {
                                             @Override
                                             protected void initChannel(SocketChannel ch) throws Exception {
                                                 ch.pipeline()
-                                                        .addLast(new ObjectEncoder())
-                                                        .addLast(new ObjectDecoder(1024 * 1024, ClassResolvers.weakCachingConcurrentResolver(this.getClass().getClassLoader())))
-                                                        .addLast(rpcClientHandler); // 使用单例Handler
+                                                        .addLast(new RpcEncoder(RpcRequest.class, serializer)) // 使用加载的序列化器
+                                                        .addLast(new RpcDecoder(RpcResponse.class, serializer)) // 使用加载的序列化器
+                                                        .addLast(rpcClientHandler);
                                             }
                                         });
                                 ChannelFuture connectFuture = bootstrap.connect(host, port).sync();
@@ -377,208 +408,3 @@ public class RpcClient {
         }
     }
 }
-
-//package rpc;
-//
-//import org.apache.zookeeper.WatchedEvent;
-//import org.apache.zookeeper.Watcher;
-//import org.apache.zookeeper.ZooKeeper;
-//import org.apache.zookeeper.data.Stat; // 确保这一行存在且正确
-//
-//import java.io.*;
-//import java.lang.reflect.*;
-//import java.lang.reflect.Proxy;
-//import java.net.*;
-//import java.util.ArrayList;
-//import java.util.List;
-//import java.util.concurrent.CopyOnWriteArrayList; // 线程安全的列表
-//import java.util.concurrent.ThreadLocalRandom; // 用于随机选择
-//
-///**
-// * RpcClient类，现在使用ZooKeeper进行服务发现。
-// * 它能够根据接口类和ZooKeeper地址动态查找服务提供者的地址。
-// */
-//public class RpcClient {
-//    private String zkAddress; // ZooKeeper服务器地址
-//    private ZooKeeper zk; // ZooKeeper客户端实例
-//    private final String ZK_REGISTRY_PATH = "/rpc/services"; // ZooKeeper中服务注册的根路径
-//
-//    // 存储某个接口对应的所有服务地址列表，这里用CopyOnWriteArrayList保证线程安全
-//    // 并且方便在watcher事件中更新
-//    private volatile List<String> serviceAddresses = new CopyOnWriteArrayList<>();
-//
-//    public RpcClient(String zkAddress) {
-//        this.zkAddress = zkAddress;
-//        connectZooKeeper(); // 客户端启动时就连接ZooKeeper
-//    }
-//
-//    /**
-//     * 为给定的接口类创建一个动态代理，该代理能够通过ZooKeeper发现并调用远程服务。
-//     *
-//     * @param interfaceClass 远程服务接口的Class对象。
-//     * @param <T> 接口类型。
-//     * @return 接口的代理实例。
-//     */
-//    public <T> T getProxy(Class<T> interfaceClass) {
-//        // 在创建代理时，尝试发现服务地址并设置Watcher
-//        discoverService(interfaceClass.getName());
-//
-//        return (T) Proxy.newProxyInstance(
-//                interfaceClass.getClassLoader(),
-//                new Class<?>[]{interfaceClass},
-//                (proxy, method, args) -> {
-//                    // 如果没有可用的服务地址，则抛出异常
-//                    if (serviceAddresses.isEmpty()) {
-//                        throw new RuntimeException("No service provider available for " + interfaceClass.getName() + ". Please check if service is running and registered.");
-//                    }
-//
-//                    // 简单的负载均衡：随机选择一个可用的服务地址
-//                    String chosenAddress = serviceAddresses.get(ThreadLocalRandom.current().nextInt(serviceAddresses.size()));
-//                    String[] addressParts = chosenAddress.split(":");
-//                    String host = addressParts[0];
-//                    int port = Integer.parseInt(addressParts[1]);
-//
-//                    System.out.println("Connecting to service " + interfaceClass.getName() + " at: " + host + ":" + port);
-//
-//                    // 建立与远程服务提供者的Socket连接
-//                    Socket socket = new Socket(host, port);
-//                    // 获取输出流和输入流
-//                    // 注意：创建ObjectOutputStream需要在ObjectInputStream之前，
-//                    // 否则可能导致死锁（ObjectInputStream构造函数会等待读取流头）
-//                    ObjectOutputStream output = new ObjectOutputStream(socket.getOutputStream());
-//                    ObjectInputStream input = new ObjectInputStream(socket.getInputStream());
-//
-//                    // --- 发送RPC调用请求信息给服务器 ---
-//                    output.writeUTF(interfaceClass.getName());
-//                    output.writeUTF(method.getName());
-//                    output.writeObject(method.getParameterTypes());
-//                    output.writeObject(args);
-//                    output.flush(); // 确保所有数据都发送出去
-//
-//                    // --- 接收服务器返回的结果 ---
-//                    Object result = input.readObject();
-//
-//                    // --- 关闭资源 ---
-//                    // 在finally块中关闭资源是最佳实践，确保无论是否发生异常都能关闭
-//                    // 但由于这里是代理方法，每次调用都会创建新的Socket，所以直接关闭也是可以的
-//                    output.close();
-//                    input.close();
-//                    socket.close();
-//                    System.out.println("RPC call completed, received result.");
-//
-//                    // 如果服务器返回的是异常对象，则客户端抛出该异常
-//                    if (result instanceof Throwable) {
-//                        throw new InvocationTargetException((Throwable) result);
-//                    }
-//                    return result;
-//                });
-//    }
-//
-//    // 连接ZooKeeper的方法
-//    private void connectZooKeeper() {
-//        try {
-//            // Watcher用于处理ZooKeeper事件。这里设置了对子节点变化的监听。
-//            zk = new ZooKeeper(zkAddress, 5000, new Watcher() {
-//                @Override
-//                public void process(WatchedEvent event) {
-//                    if (event.getState() == Event.KeeperState.SyncConnected) {
-//                        System.out.println("Client connected to ZooKeeper successfully!");
-//                    } else if (event.getState() == Event.KeeperState.Disconnected) {
-//                        System.err.println("Client disconnected from ZooKeeper! Attempting to reconnect...");
-//                        // 实际应用中需要处理重连逻辑
-//                    } else if (event.getType() == Event.EventType.NodeChildrenChanged) {
-//                        // 当服务节点的子节点（即服务实例）发生变化时（服务上线或下线），Watcher会被触发
-//                        System.out.println("Service instances changed, re-discovering services for path: " + event.getPath());
-//                        // 重新发现服务。event.getPath()会是如 "/rpc/services/service.Calculator"
-//                        // 我们需要从中提取出 "service.Calculator"
-//                        String serviceInterfaceName = event.getPath().substring(ZK_REGISTRY_PATH.length() + 1);
-//                        discoverService(serviceInterfaceName);
-//                    }
-//                }
-//            });
-//        } catch (IOException e) {
-//            System.err.println("Client failed to connect to ZooKeeper: " + e.getMessage());
-//            e.printStackTrace();
-//        }
-//    }
-//
-//    // 发现服务的方法，并设置Watcher监听子节点变化
-//    private void discoverService(String serviceInterfaceName) {
-//        try {
-//            String servicePath = ZK_REGISTRY_PATH + "/" + serviceInterfaceName;
-//            // 检查服务路径本身是否存在，如果不存在，则表示该服务未注册任何实例
-//            Stat servicePathStat = zk.exists(servicePath, false);
-//            if (servicePathStat == null) {
-//                System.out.println("Service path does not exist for: " + servicePath);
-//                this.serviceAddresses.clear(); // 清空地址列表
-//                return;
-//            }
-//
-//            // 获取指定服务路径下的所有子节点（即服务实例的注册信息）
-//            // 并设置一个Watcher，当子节点列表发生变化时，Watcher会被触发
-//            List<String> children = zk.getChildren(servicePath, true); // true表示设置watcher
-//            List<String> addresses = new ArrayList<>();
-//            for (String child : children) {
-//                // 子节点的名字是 IP:Port-sequenceNumber，我们需要提取 IP:Port
-//                String[] parts = child.split("-");
-//                if (parts.length > 0) {
-//                    addresses.add(parts[0]);
-//                }
-//            }
-//            // 原子性地更新本地缓存的服务地址列表
-//            this.serviceAddresses = new CopyOnWriteArrayList<>(addresses);
-//            System.out.println("Discovered service addresses for " + serviceInterfaceName + ": " + serviceAddresses);
-//        } catch (Exception e) {
-//            System.err.println("Error discovering services from ZooKeeper: " + e.getMessage());
-//            e.printStackTrace();
-//        }
-//    }
-//
-//    // 在客户端关闭时关闭ZooKeeper连接
-//    public void closeZooKeeper() {
-//        if (zk != null) {
-//            try {
-//                zk.close();
-//                System.out.println("Client ZooKeeper connection closed.");
-//            } catch (InterruptedException e) {
-//                System.err.println("Error closing client ZooKeeper connection: " + e.getMessage());
-//                // 重新设置中断状态
-//                Thread.currentThread().interrupt();
-//            }
-//        }
-//    }
-//}
-
-
-//package rpc;
-//
-//import java.io.*;
-//import java.lang.reflect.*;
-//import java.lang.reflect.Proxy;
-//import java.net.*;
-//
-//public class RpcClient {
-//    public <T> T getProxy(Class<T> interfaceClass, String host, int port) {
-//        return (T) Proxy.newProxyInstance(
-//                interfaceClass.getClassLoader(),
-//                new Class<?>[]{interfaceClass},
-//                (proxy, method, args) -> {
-//                    Socket socket = new Socket(host, port);
-//                    ObjectOutputStream output = new ObjectOutputStream(socket.getOutputStream());
-//                    ObjectInputStream input = new ObjectInputStream(socket.getInputStream());
-//
-//                    output.writeUTF(interfaceClass.getName());
-//                    output.writeUTF(method.getName());
-//                    output.writeObject(method.getParameterTypes());
-//                    output.writeObject(args);
-//
-//                    Object result = input.readObject();
-//
-//                    output.close();
-//                    input.close();
-//                    socket.close();
-//
-//                    return result;
-//                });
-//    }
-//}
